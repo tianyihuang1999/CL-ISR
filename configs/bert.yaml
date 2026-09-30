@@ -1,3 +1,4 @@
+model_kind: transformer
 seed: 42
 max_length: 512
 batch_size: 16
@@ -17,12 +18,12 @@ dropout: 0.1
 encoder_name: bert-base-uncased
 augmentation: hybrid
 pretrained: true
-use_cl: true
-use_isr: true
+use_cl: false
+use_isr: false
 fusion: gated
 freeze_isr_backbone: false
 num_workers: 0
-output_dir: outputs
+output_dir: outputs/bert
 train_path: data/sample/train.csv
 val_path: data/sample/val.csv
 test_path: data/sample/test.csv

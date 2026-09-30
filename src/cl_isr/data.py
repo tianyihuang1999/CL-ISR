@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+import hashlib
 
 import pandas as pd
 import torch
@@ -12,16 +11,29 @@ from torch.utils.data import Dataset
 from .augment import two_views
 
 STANCE_TO_ID = {-1: 0, 0: 1, 1: 2}
+MISSING_STANCE = -100
 
 
-@dataclass
-class Batch:
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
-    view_ids: torch.Tensor
-    view_mask: torch.Tensor
-    labels: torch.Tensor
-    stance: torch.Tensor
+def validate_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate annotations without inventing labels or converting NaN to text."""
+    df = df.copy()
+    if not {"text", "label"}.issubset(df.columns):
+        raise ValueError("CSV must contain columns: text, label")
+    if df.empty:
+        raise ValueError("Dataset must not be empty")
+    if df["text"].isna().any() or df["text"].astype(str).str.strip().eq("").any():
+        raise ValueError("Text must be non-empty and non-missing")
+    labels = pd.to_numeric(df["label"], errors="raise")
+    if not labels.isin([0, 1]).all():
+        raise ValueError("Labels must be 0 (real) or 1 (misleading)")
+    df["label"] = labels.astype(int)
+    if "stance" not in df:
+        df["stance"] = float("nan")
+    stance = pd.to_numeric(df["stance"], errors="raise")
+    if not (stance.isna() | stance.isin(STANCE_TO_ID)).all():
+        raise ValueError("Stance must be -1, 0, 1, or missing")
+    df["stance"] = stance
+    return df
 
 
 class MisleadingTextDataset(Dataset):
@@ -32,16 +44,14 @@ class MisleadingTextDataset(Dataset):
         max_length: int = 512,
         augment_strategy: str = "hybrid",
         train: bool = True,
+        use_cl: bool = True,
     ):
-        self.df = pd.read_csv(path)
-        if "text" not in self.df.columns or "label" not in self.df.columns:
-            raise ValueError("CSV must contain columns: text, label")
-        if "stance" not in self.df.columns:
-            self.df["stance"] = 0
+        self.df = validate_frame(pd.read_csv(path))
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.augment_strategy = augment_strategy
         self.train = train
+        self.use_cl = use_cl
 
     def __len__(self) -> int:
         return len(self.df)
@@ -59,18 +69,21 @@ class MisleadingTextDataset(Dataset):
         row = self.df.iloc[idx]
         text = str(row["text"])
         label = int(row["label"])
-        stance = STANCE_TO_ID.get(int(row["stance"]), 1)
-        view_a, view_b = (two_views(text, self.augment_strategy) if self.train else (text, text))
-        enc_a = self._encode(view_a)
-        enc_b = self._encode(view_b)
-        return {
-            "input_ids": enc_a["input_ids"].squeeze(0),
-            "attention_mask": enc_a["attention_mask"].squeeze(0),
-            "view_ids": enc_b["input_ids"].squeeze(0),
-            "view_mask": enc_b["attention_mask"].squeeze(0),
+        stance = MISSING_STANCE if pd.isna(row["stance"]) else STANCE_TO_ID[int(row["stance"])]
+        enc = self._encode(text)
+        item = {
+            "input_ids": enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
             "labels": torch.tensor(label, dtype=torch.long),
             "stance": torch.tensor(stance, dtype=torch.long),
         }
+        if self.train and self.use_cl:
+            view_a, view_b = two_views(text, self.augment_strategy)
+            for name, view in [("a", view_a), ("b", view_b)]:
+                encoded = self._encode(view)
+                item[f"view_{name}_ids"] = encoded["input_ids"].squeeze(0)
+                item[f"view_{name}_mask"] = encoded["attention_mask"].squeeze(0)
+        return item
 
 
 def collate(batch: list[dict]) -> dict:
@@ -82,12 +95,16 @@ class SimpleTokenizer:
     """Hash tokenizer for smoke tests without downloading BERT."""
 
     def __init__(self, vocab_size: int = 30522, max_length: int = 64):
+        if vocab_size < 3 or max_length < 1:
+            raise ValueError("vocab_size must be >= 3 and max_length must be positive")
         self.vocab_size = vocab_size
         self.model_max_length = max_length
 
     def __call__(self, text, truncation=True, padding="max_length", max_length=None, return_tensors="pt"):
         max_length = max_length or self.model_max_length
-        ids = [(hash(tok) % (self.vocab_size - 2)) + 1 for tok in text.split()][:max_length]
+        # 0 is padding; 1 is reserved for an empty input. Stable across processes.
+        ids = [(int.from_bytes(hashlib.sha256(tok.encode("utf-8")).digest()[:8], "big")
+                % (self.vocab_size - 2)) + 2 for tok in text.split()][:max_length] or [1]
         pad = max_length - len(ids)
         input_ids = ids + [0] * pad
         mask = [1] * len(ids) + [0] * pad

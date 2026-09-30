@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 
 import torch
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -41,3 +42,35 @@ def test_forward_dummy():
         1.0,
     )
     loss.backward()
+
+
+def test_infonce_prefers_correct_pairs():
+    z = torch.eye(4)
+    assert infonce_loss(z, z) < infonce_loss(z, z.roll(1, 0))
+    for temperature in (0, -1, float("nan")):
+        with pytest.raises(ValueError):
+            infonce_loss(z, z, temperature)
+
+
+def test_isr_removal_and_mean_fusion():
+    ids = torch.tensor([[1, 2, 0], [3, 4, 5]])
+    mask = ids.ne(0).long()
+    model = CLISR(CLISRConfig(pretrained=False, vocab_size=10, hidden_size=8, lstm_hidden=4, use_isr=False))
+    out = model(ids, mask)
+    assert model.isr is None and model.fusion is None
+    assert out["stance_logits"] is None
+    assert torch.equal(out["r"], out["h"])
+    model = CLISR(CLISRConfig(pretrained=False, vocab_size=10, hidden_size=8, lstm_hidden=4, fusion="mean"))
+    out = model(ids, mask)
+    assert model.fusion is None
+    assert torch.equal(out["r"], (out["h"] + out["s"]) / 2)
+    assert out["alpha"][0, 2].item() == 0
+    assert torch.allclose(out["alpha"].sum(-1), torch.ones(2))
+
+
+def test_isr_padding_does_not_change_prediction():
+    model = CLISR(CLISRConfig(pretrained=False, vocab_size=10, hidden_size=8, lstm_hidden=4)).eval()
+    with torch.no_grad():
+        a = model(torch.tensor([[1, 2]]), torch.tensor([[1, 1]]))
+        b = model(torch.tensor([[1, 2, 0, 0]]), torch.tensor([[1, 1, 0, 0]]))
+    assert torch.allclose(a["logits"], b["logits"], atol=1e-6)

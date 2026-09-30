@@ -79,7 +79,9 @@ def augment(text: str, strategy: str = "hybrid", rng: random.Random | None = Non
         return synonym_replacement(text, rng=rng)
     if strategy == "insertion":
         return random_insertion(text, rng=rng)
-    return hybrid_augment(text, rng=rng)
+    if strategy == "hybrid":
+        return hybrid_augment(text, rng=rng)
+    raise ValueError(f"Unknown augmentation strategy: {strategy}")
 
 
 def two_views(text: str, strategy: str = "hybrid", rng: random.Random | None = None) -> tuple[str, str]:
